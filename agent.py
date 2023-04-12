@@ -7,23 +7,34 @@ from dotenv import load_dotenv
 # Load default environment variables (.env)
 load_dotenv()
 
+agents = {}
 
-def generate(prompt):
+def create_agent(agent_name, table_name, model="gpt-3.5-turbo", temperature=1.0, max_tokens=100, initial_prompt=None):
+    new_agent = Agent(agent_name=agent_name, table_name=table_name, model=model, temperature=temperature, max_tokens=max_tokens, initial_prompt=initial_prompt)
+    return new_agent
+
+def get_agent(agent_name):
+    return agents.get(agent_name)
+
+def generate(agent, prompt):
     completion = openai.ChatCompletion.create(
-    model="gpt-4",
-    messages=[
-        {"role": "system", "content": "You are an intelligent agent with thoughts and memories. You have a memory which stores your past thoughts and actions and also how other users have interacted with you."},
-        {"role": "system", "content": "Keep your thoughts relatively simple and concise"},
-        {"role": "user", "content": prompt},
+        model=agent.model,
+        temperature=agent.temperature,
+        max_tokens=agent.max_tokens,
+        messages=[
+            {"role": "system", "content": agent.initial_prompt +"You have a memory which stores your past thoughts and actions and also how other users have interacted with you"},
+            {"role": "system", "content": "Keep your thoughts relatively simple and concise"},
+            {"role": "user", "content": prompt},
         ]
     )
+    response_text = completion.choices[0].message["content"]
+    return response_text
 
-    return completion.choices[0].message["content"]
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_ENV = os.getenv("PINECONE_API_ENV")
-#PINECONE_API_ENV = "asia-southeast1-gcp"
+
     
 # Prompt Initialization
 with open('prompts.yaml', 'r') as f:
@@ -49,15 +60,26 @@ openai.api_key = OPENAI_API_KEY # you can just copy and paste your key here if y
 
 def get_ada_embedding(text):
         text = text.replace("\n", " ")
-        return openai.Embedding.create(input=[text], model="text-embedding-ada-002")[
-            "data"
-        ][0]["embedding"]
+        return openai.Embedding.create(input=[text], model="text-embedding-ada-002")["data"][0]["embedding"]
 
 
-class Agent():
-    def __init__(self, table_name=None) -> None:
+class Agent:
+    def __init__(
+        self,
+        agent_name,
+        table_name,
+        model="gpt-3.5-turbo",
+        temperature=1.0,
+        max_tokens=100,
+        initial_prompt=None,
+    ):
+        self.agent_name = agent_name
         self.table_name = table_name
-        self.memory = None
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.initial_prompt = initial_prompt
+        self.memory = pinecone.Index(self.table_name)
         self.thought_id_count = int(counter['count'])
 
     # Keep Remebering!
@@ -66,14 +88,14 @@ class Agent():
     #         yaml.dump({'count': str(self.thought_id_count)}, f)
     
 
-    def createIndex(self, table_name=None):
+    def createIndex(self, table_name="agi"):
         # Create Pinecone index
         if(table_name):
             self.table_name = table_name
 
         if(self.table_name == None):
             return
-
+        table_name = "agi"
         dimension = 1536
         metric = "cosine"
         pod_type = "p1"
@@ -93,15 +115,16 @@ class Agent():
 
         vector = get_ada_embedding(new_thought)
         upsert_response = self.memory.upsert(
-        vectors=[
-            {
-            'id':f"thought-{self.thought_id_count}", 
-            'values':vector, 
-            'metadata':
-                {"thought_string": new_thought, 
-                 "thought_type": thought_type}
-            }],
-	    namespace=THOUGHTS,
+            vectors=[
+                {
+                    'id': f"{self.agent_name}-thought-{self.thought_id_count}",
+                    'values': vector,
+                    'metadata':
+                        {"thought_string": new_thought,
+                         "thought_type": thought_type,
+                         "agent_name": self.agent_name}
+                }],
+            namespace=THOUGHTS,
         )
 
         self.thought_id_count += 1
@@ -110,35 +133,58 @@ class Agent():
     def internalThought(self, query) -> str:
         query_embedding = get_ada_embedding(query)
         results = self.memory.query(query_embedding, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
-        sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
+        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
+        sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
         top_matches = "\n\n".join([(str(item.metadata["thought_string"])) for item in sorted_results])
-        #print(top_matches)
+        print(f"top matches\n {top_matches}")
+        print(f"-----------------------------------")
         
         internalThoughtPrompt = data['internal_thought']
         internalThoughtPrompt = internalThoughtPrompt.replace("{query}", query).replace("{top_matches}", top_matches)
-        # print("------------INTERNAL THOUGHT PROMPT------------")
-        # print(internalThoughtPrompt)
-        internal_thought = generate(internalThoughtPrompt) # OPENAI CALL: top_matches and query text is used here
+        print(f"{self.agent_name}------------INTERNAL THOUGHT PROMPT------------")
+        print(internalThoughtPrompt)
+        internal_thought = generate(self,internalThoughtPrompt) # OPENAI CALL: top_matches and query text is used here
         
         # Debugging purposes
-        #print(internal_thought)
+        print(internal_thought)
 
         internalMemoryPrompt = data['internal_thought_memory']
-        internalMemoryPrompt = internalMemoryPrompt.replace("{query}", query).replace("{internal_thought}", internal_thought)
+        internalMemoryPrompt = internalMemoryPrompt.replace("{query}", query)
+
+        if internal_thought is not None:
+            internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", internal_thought)
+        else:
+            internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", "")
         self.updateMemory(internalMemoryPrompt, "Internal")
         return internal_thought, top_matches
 
     def action(self, query) -> str:
         internal_thought, top_matches = self.internalThought(query)
-        
+
         externalThoughtPrompt = data['external_thought']
-        externalThoughtPrompt = externalThoughtPrompt.replace("{query}", query).replace("{top_matches}", top_matches).replace("{internal_thought}", internal_thought)
-        # print("------------EXTERNAL THOUGHT PROMPT------------")
-        # print(externalThoughtPrompt)
-        external_thought = generate(externalThoughtPrompt) # OPENAI CALL: top_matches and query text is used here
+        externalThoughtPrompt = externalThoughtPrompt.replace("{query}", query)
+
+        if top_matches is not None:
+            externalThoughtPrompt = externalThoughtPrompt.replace("{top_matches}", top_matches)
+        else:
+            externalThoughtPrompt = externalThoughtPrompt.replace("{top_matches}", "")
+
+        if internal_thought is not None:
+            externalThoughtPrompt = externalThoughtPrompt.replace("{internal_thought}", internal_thought)
+        else:
+            externalThoughtPrompt = externalThoughtPrompt.replace("{internal_thought}", "")
+
+        external_thought = generate(self, externalThoughtPrompt)  # OPENAI CALL: top_matches and query text is used here
 
         externalMemoryPrompt = data['external_thought_memory']
-        externalMemoryPrompt = externalMemoryPrompt.replace("{query}", query).replace("{external_thought}", external_thought)
+
+        externalMemoryPrompt = externalMemoryPrompt.replace("{query}", query)
+
+        if top_matches is not None:
+            externalMemoryPrompt = externalMemoryPrompt.replace("{top_matches}", top_matches)
+        else:
+            externalMemoryPrompt = externalMemoryPrompt.replace("{top_matches}", "")
+
         self.updateMemory(externalMemoryPrompt, "External")
         request_memory = data["request_memory"]
         self.updateMemory(request_memory.replace("{query}", query), "Query")
