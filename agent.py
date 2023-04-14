@@ -3,6 +3,8 @@ import os
 import pinecone
 import yaml
 from dotenv import load_dotenv
+from sklearn.cluster import KMeans
+import numpy as np
 
 # Load default environment variables (.env)
 load_dotenv()
@@ -77,6 +79,8 @@ class Agent:
             temperature=1.0,
             max_tokens=100,
             initial_prompt=None,
+            n_clusters=5,  # Add the n_clusters attribute here
+
     ):
         self.agent_name = agent_name
         self.table_name = table_name
@@ -86,6 +90,8 @@ class Agent:
         self.initial_prompt = initial_prompt
         self.memory = pinecone.Index(self.table_name)
         self.thought_id_count = int(counter['count'])
+        self.n_clusters = n_clusters
+        self.cluster_update_interval = 10
 
     # Keep Remebering!
     # def __del__(self) -> None:
@@ -120,7 +126,8 @@ class Agent:
         return 1 - sorted_results[0].score
 
     # Adds new "Thought" to agent. thought_type is Query, Internal, and External
-    def updateMemory(self, new_thought, thought_type):
+    def updateMemory(self, new_thought, thought_type, cluster_label):
+
         with open('memory_count.yaml', 'w') as f:
             yaml.dump({'count': str(self.thought_id_count)}, f)
 
@@ -135,33 +142,42 @@ class Agent:
                         {"thought_string": new_thought,
                          "thought_type": thought_type,
                          "agent_name": self.agent_name,
-                         "surprise_score": surprise_score}
+                         "cluster_label": cluster_label}  # Add the cluster_label to the metadata
                 }],
             namespace=THOUGHTS,
         )
 
         self.thought_id_count += 1
+        if self.thought_id_count % self.cluster_update_interval == 0:
+            self.cluster_memories()
 
     # Agent thinks about given query based on top k related memories. Internal thought is passed to external thought
     def internalThought(self, query, min_surprise_score=0.2) -> str:
         query_embedding = get_ada_embedding(query)
-        results = self.memory.query(query_embedding, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
-        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
-        sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
-        top_matches = "\n\n".join([str(item.metadata["thought_string"]) for item in sorted_results if
-                                   item.metadata.get("surprise_score", 0) >= min_surprise_score])
 
-        # print(f"top matches\n {top_matches}")
-        # print(f"-----------------------------------")
+        # Retrieve more results
+        results = self.memory.query(query_embedding, top_k=k_n * self.n_clusters, include_metadata=True,
+                                    namespace=THOUGHTS)
+        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
+        sorted_results = sorted(filtered_results, key=lambda x: (x.metadata.get("cluster_label", 0), x.score),
+                                reverse=True)
+
+        # Select top k_n results with different cluster labels
+        top_matches = []
+        seen_clusters = set()
+        for match in sorted_results:
+            if len(top_matches) >= k_n:
+                break
+            if match.metadata.get("cluster_label", 0) not in seen_clusters:
+                top_matches.append(match.metadata["thought_string"])  # Append the thought string instead of metadata
+                seen_clusters.add(match.metadata.get("cluster_label", 0))
+
+        top_matches_str = "\n\n".join(top_matches)  # Convert the list of top_matches to a single string
 
         internalThoughtPrompt = data['internal_thought']
-        internalThoughtPrompt = internalThoughtPrompt.replace("{query}", query).replace("{top_matches}", top_matches)
-        # print(f"{self.agent_name}------------INTERNAL THOUGHT PROMPT------------")
-        # print(internalThoughtPrompt)
+        internalThoughtPrompt = internalThoughtPrompt.replace("{query}", query).replace("{top_matches}",
+                                                                                        top_matches_str)
         internal_thought = generate(self, internalThoughtPrompt)  # OPENAI CALL: top_matches and query text is used here
-
-        # Debugging purposes
-        # print(internal_thought)
 
         internalMemoryPrompt = data['internal_thought_memory']
         internalMemoryPrompt = internalMemoryPrompt.replace("{query}", query)
@@ -170,8 +186,8 @@ class Agent:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", internal_thought)
         else:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", "")
-        self.updateMemory(internalMemoryPrompt, "Internal")
-        return internal_thought, top_matches
+        self.updateMemory(internalMemoryPrompt, "Internal", cluster_label=match.metadata.get("cluster_label", 0))
+        return internal_thought, top_matches_str
 
     def action(self, query) -> str:
         internal_thought, top_matches = self.internalThought(query)
@@ -200,11 +216,29 @@ class Agent:
         else:
             externalMemoryPrompt = externalMemoryPrompt.replace("{top_matches}", "")
 
-        self.updateMemory(externalMemoryPrompt, "External")
+        self.updateMemory(externalMemoryPrompt, "External", cluster_label=0)
+
         request_memory = data["request_memory"]
-        self.updateMemory(request_memory.replace("{query}", query), "Query")
+        self.updateMemory(request_memory.replace("{query}", query), "Query", cluster_label=0)
         return external_thought
 
     # Make agent read some information (learn) WIP
     def read(self, text) -> str:
         pass
+
+    def cluster_memories(self, n_clusters=5):
+        # Fetch all memories and their embeddings
+        all_memories = self.memory.fetch_all(include_metadata=True, namespace=THOUGHTS)
+
+        # Extract the embeddings and metadata
+        embeddings = [memory.values for memory in all_memories]
+        metadata = [memory.metadata for memory in all_memories]
+
+        # Perform clustering
+        kmeans = KMeans(n_clusters=n_clusters)
+        labels = kmeans.fit_predict(embeddings)
+
+        # Update memory metadata with cluster labels
+        for i, memory_id in enumerate(all_memories.ids):
+            metadata[i]["cluster_label"] = labels[i]
+            self.memory.update_metadata(memory_id, metadata[i], namespace=THOUGHTS)
