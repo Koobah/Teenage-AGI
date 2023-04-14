@@ -9,12 +9,16 @@ load_dotenv()
 
 agents = {}
 
+
 def create_agent(agent_name, table_name, model="gpt-3.5-turbo", temperature=1.0, max_tokens=100, initial_prompt=None):
-    new_agent = Agent(agent_name=agent_name, table_name=table_name, model=model, temperature=temperature, max_tokens=max_tokens, initial_prompt=initial_prompt)
+    new_agent = Agent(agent_name=agent_name, table_name=table_name, model=model, temperature=temperature,
+                      max_tokens=max_tokens, initial_prompt=initial_prompt)
     return new_agent
+
 
 def get_agent(agent_name):
     return agents.get(agent_name)
+
 
 def generate(agent, prompt):
     completion = openai.ChatCompletion.create(
@@ -22,7 +26,8 @@ def generate(agent, prompt):
         temperature=agent.temperature,
         max_tokens=agent.max_tokens,
         messages=[
-            {"role": "system", "content": agent.initial_prompt +"You have a memory which stores your past thoughts and actions and also how other users have interacted with you"},
+            {"role": "system",
+             "content": agent.initial_prompt + "You have a memory which stores your past thoughts and actions and also how other users have interacted with you"},
             {"role": "system", "content": "Keep your thoughts relatively simple and concise"},
             {"role": "user", "content": prompt},
         ]
@@ -35,7 +40,6 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_ENV = os.getenv("PINECONE_API_ENV")
 
-    
 # Prompt Initialization
 with open('prompts.yaml', 'r') as f:
     data = yaml.load(f, Loader=yaml.FullLoader)
@@ -56,22 +60,23 @@ k_n = 5
 pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_API_ENV)
 
 # initialize openAI
-openai.api_key = OPENAI_API_KEY # you can just copy and paste your key here if you want
+openai.api_key = OPENAI_API_KEY  # you can just copy and paste your key here if you want
+
 
 def get_ada_embedding(text):
-        text = text.replace("\n", " ")
-        return openai.Embedding.create(input=[text], model="text-embedding-ada-002")["data"][0]["embedding"]
+    text = text.replace("\n", " ")
+    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")["data"][0]["embedding"]
 
 
 class Agent:
     def __init__(
-        self,
-        agent_name,
-        table_name,
-        model="gpt-3.5-turbo",
-        temperature=1.0,
-        max_tokens=100,
-        initial_prompt=None,
+            self,
+            agent_name,
+            table_name,
+            model="gpt-3.5-turbo",
+            temperature=1.0,
+            max_tokens=100,
+            initial_prompt=None,
     ):
         self.agent_name = agent_name
         self.table_name = table_name
@@ -86,14 +91,13 @@ class Agent:
     # def __del__(self) -> None:
     #     with open('memory_count.yaml', 'w') as f:
     #         yaml.dump({'count': str(self.thought_id_count)}, f)
-    
 
     def createIndex(self, table_name="agi"):
         # Create Pinecone index
-        if(table_name):
+        if (table_name):
             self.table_name = table_name
 
-        if(self.table_name == None):
+        if (self.table_name == None):
             return
         table_name = "agi"
         dimension = 1536
@@ -107,13 +111,21 @@ class Agent:
         # Give memory
         self.memory = pinecone.Index(self.table_name)
 
-    
+    def calculate_surprise(self, memory_embedding, k=5):
+        results = self.memory.query(memory_embedding, top_k=k, include_metadata=True, namespace=THOUGHTS)
+        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
+        sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
+        if not sorted_results:
+            return 1.0
+        return 1 - sorted_results[0].score
+
     # Adds new "Thought" to agent. thought_type is Query, Internal, and External
     def updateMemory(self, new_thought, thought_type):
         with open('memory_count.yaml', 'w') as f:
-             yaml.dump({'count': str(self.thought_id_count)}, f)
+            yaml.dump({'count': str(self.thought_id_count)}, f)
 
         vector = get_ada_embedding(new_thought)
+        surprise_score = self.calculate_surprise(vector)
         upsert_response = self.memory.upsert(
             vectors=[
                 {
@@ -122,7 +134,8 @@ class Agent:
                     'metadata':
                         {"thought_string": new_thought,
                          "thought_type": thought_type,
-                         "agent_name": self.agent_name}
+                         "agent_name": self.agent_name,
+                         "surprise_score": surprise_score}
                 }],
             namespace=THOUGHTS,
         )
@@ -130,23 +143,25 @@ class Agent:
         self.thought_id_count += 1
 
     # Agent thinks about given query based on top k related memories. Internal thought is passed to external thought
-    def internalThought(self, query) -> str:
+    def internalThought(self, query, min_surprise_score=0.2) -> str:
         query_embedding = get_ada_embedding(query)
         results = self.memory.query(query_embedding, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
         filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
         sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
-        top_matches = "\n\n".join([(str(item.metadata["thought_string"])) for item in sorted_results])
-        print(f"top matches\n {top_matches}")
-        print(f"-----------------------------------")
-        
+        top_matches = "\n\n".join([str(item.metadata["thought_string"]) for item in sorted_results if
+                                   item.metadata.get("surprise_score", 0) >= min_surprise_score])
+
+        # print(f"top matches\n {top_matches}")
+        # print(f"-----------------------------------")
+
         internalThoughtPrompt = data['internal_thought']
         internalThoughtPrompt = internalThoughtPrompt.replace("{query}", query).replace("{top_matches}", top_matches)
-        print(f"{self.agent_name}------------INTERNAL THOUGHT PROMPT------------")
-        print(internalThoughtPrompt)
-        internal_thought = generate(self,internalThoughtPrompt) # OPENAI CALL: top_matches and query text is used here
-        
+        # print(f"{self.agent_name}------------INTERNAL THOUGHT PROMPT------------")
+        # print(internalThoughtPrompt)
+        internal_thought = generate(self, internalThoughtPrompt)  # OPENAI CALL: top_matches and query text is used here
+
         # Debugging purposes
-        print(internal_thought)
+        # print(internal_thought)
 
         internalMemoryPrompt = data['internal_thought_memory']
         internalMemoryPrompt = internalMemoryPrompt.replace("{query}", query)
@@ -189,17 +204,7 @@ class Agent:
         request_memory = data["request_memory"]
         self.updateMemory(request_memory.replace("{query}", query), "Query")
         return external_thought
-    
+
     # Make agent read some information (learn) WIP
     def read(self, text) -> str:
         pass
-
-
-
-
-
-    
-
-
-
-    
