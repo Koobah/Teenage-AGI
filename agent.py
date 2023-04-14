@@ -120,12 +120,11 @@ class Agent:
 
 
     # Adds new "Thought" to agent. thought_type is Query, Internal, and External
-    def updateMemory(self, new_thought, thought_type):
+    def updateMemory(self, new_thought, thought_type, is_semantic_memory):
         with open('memory_count.yaml', 'w') as f:
             yaml.dump({'count': str(self.thought_id_count)}, f)
 
         vector = get_ada_embedding(new_thought)
-        surprise_score = self.calculate_surprise(vector)
         upsert_response = self.memory.upsert(
             vectors=[
                 {
@@ -135,7 +134,7 @@ class Agent:
                         {"thought_string": new_thought,
                          "thought_type": thought_type,
                          "agent_name": self.agent_name,
-                         "surprise_score": surprise_score}
+                         "is_semantic_memory": is_semantic_memory}
                 }],
             namespace=THOUGHTS,
         )
@@ -143,12 +142,18 @@ class Agent:
         self.thought_id_count += 1
 
     # Agent thinks about given query based on top k related memories. Internal thought is passed to external thought
-    def internalThought(self, query, min_surprise_score=0.2) -> str:
+    def internalThought(self, query, is_semantic_memory=True) -> str:
         query_embedding = get_ada_embedding(query)
         results = self.memory.query(query_embedding, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
-        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
+
+        # Filter the results based on the is_semantic_memory flag
+        filtered_results = [match for match in results.matches if
+                            match.metadata.get("is_semantic_memory") == is_semantic_memory and match.metadata.get(
+                                "agent_name") == self.agent_name]
+
         sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
-        top_matches = "\n\n".join([str(item.metadata["thought_string"]) for item in sorted_results if item.metadata.get("surprise_score", 0) >= min_surprise_score])
+        top_matches = "\n\n".join([(str(item.metadata["thought_string"])) for item in sorted_results])
+
         # print(f"top matches\n {top_matches}")
         # print(f"-----------------------------------")
 
@@ -168,7 +173,7 @@ class Agent:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", internal_thought)
         else:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", "")
-        self.updateMemory(internalMemoryPrompt, "Internal")
+        self.updateMemory(internalMemoryPrompt, "Internal", is_semantic_memory = "True")
         return internal_thought, top_matches
 
     def action(self, query) -> str:
@@ -198,9 +203,9 @@ class Agent:
         else:
             externalMemoryPrompt = externalMemoryPrompt.replace("{top_matches}", "")
 
-        self.updateMemory(externalMemoryPrompt, "External")
+        self.updateMemory(externalMemoryPrompt, "External", is_semantic_memory = "True")
         request_memory = data["request_memory"]
-        self.updateMemory(request_memory.replace("{query}", query), "Query")
+        self.updateMemory(request_memory.replace("{query}", query), "Query", is_semantic_memory = "True")
         return external_thought
 
     # Make agent read some information (learn) WIP
