@@ -87,17 +87,6 @@ class Agent:
     #     with open('memory_count.yaml', 'w') as f:
     #         yaml.dump({'count': str(self.thought_id_count)}, f)
 
-    def calculate_surprise(self, vector):
-        # Fetch the nearest neighbors
-        neighbors = self.memory.query(vector, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
-
-        # Calculate the average distance to the neighbors
-        avg_distance = sum(match.score for match in neighbors.matches) / len(neighbors.matches)
-
-        # Normalize the average distance to a range between 0 and 1
-        normalized_distance = 1 - avg_distance
-
-        return normalized_distance
 
     def createIndex(self, table_name="agi"):
         # Create Pinecone index
@@ -120,9 +109,9 @@ class Agent:
 
 
     # Adds new "Thought" to agent. thought_type is Query, Internal, and External
-    def updateMemory(self, new_thought, thought_type, is_semantic_memory):
+    def updateMemory(self, new_thought, thought_type):
         with open('memory_count.yaml', 'w') as f:
-            yaml.dump({'count': str(self.thought_id_count)}, f)
+             yaml.dump({'count': str(self.thought_id_count)}, f)
 
         vector = get_ada_embedding(new_thought)
         upsert_response = self.memory.upsert(
@@ -133,8 +122,7 @@ class Agent:
                     'metadata':
                         {"thought_string": new_thought,
                          "thought_type": thought_type,
-                         "agent_name": self.agent_name,
-                         "is_semantic_memory": is_semantic_memory}
+                         "agent_name": self.agent_name}
                 }],
             namespace=THOUGHTS,
         )
@@ -142,18 +130,12 @@ class Agent:
         self.thought_id_count += 1
 
     # Agent thinks about given query based on top k related memories. Internal thought is passed to external thought
-    def internalThought(self, query, is_semantic_memory=True) -> str:
+    def internalThought(self, query) -> str:
         query_embedding = get_ada_embedding(query)
         results = self.memory.query(query_embedding, top_k=k_n, include_metadata=True, namespace=THOUGHTS)
-
-        # Filter the results based on the is_semantic_memory flag
-        filtered_results = [match for match in results.matches if
-                            match.metadata.get("is_semantic_memory") == is_semantic_memory and match.metadata.get(
-                                "agent_name") == self.agent_name]
-
+        filtered_results = [match for match in results.matches if match.metadata.get("agent_name") == self.agent_name]
         sorted_results = sorted(filtered_results, key=lambda x: x.score, reverse=True)
         top_matches = "\n\n".join([(str(item.metadata["thought_string"])) for item in sorted_results])
-
         # print(f"top matches\n {top_matches}")
         # print(f"-----------------------------------")
 
@@ -173,7 +155,7 @@ class Agent:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", internal_thought)
         else:
             internalMemoryPrompt = internalMemoryPrompt.replace("{internal_thought}", "")
-        self.updateMemory(internalMemoryPrompt, "Internal", is_semantic_memory = "True")
+        self.updateMemory(internalMemoryPrompt, "Internal")
         return internal_thought, top_matches
 
     def action(self, query) -> str:
@@ -203,9 +185,9 @@ class Agent:
         else:
             externalMemoryPrompt = externalMemoryPrompt.replace("{top_matches}", "")
 
-        self.updateMemory(externalMemoryPrompt, "External", is_semantic_memory = "True")
+        self.updateMemory(externalMemoryPrompt, "External")
         request_memory = data["request_memory"]
-        self.updateMemory(request_memory.replace("{query}", query), "Query", is_semantic_memory = "True")
+        self.updateMemory(request_memory.replace("{query}", query), "Query")
         return external_thought
 
     # Make agent read some information (learn) WIP
